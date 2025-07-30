@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GLTF Folder Viewer</title>
+
+  <!-- importmap for Three.js v150+ ES modules -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.150.1/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.150.1/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    body { margin: 0; font-family: sans-serif; background: #f9f9f9; }
+    header { background: #333; color: #fff; padding: 0.5rem; text-align: center; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 1rem;
+      padding: 1rem;
+    }
+    .thumbnail {
+      position: relative;
+      padding-top: 100%;
+      background: #e0e0e0;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .thumbnail img {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%; object-fit: contain;
+    }
+    .thumbnail .label {
+      position: absolute; bottom: 0; left: 0;
+      width: 100%; background: rgba(0,0,0,0.6);
+      color: #fff; font-size: 0.75rem;
+      padding: 2px; box-sizing: border-box;
+      text-align: center; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .modal {
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.8);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    .modal.hidden { display: none; }
+    #modal-content {
+      position: relative;
+      width: 90%; max-width: 600px;
+      background: #fff; border-radius: 8px;
+      overflow: hidden;
+    }
+    #modal-canvas { width: 100%; height: 60vh; display: block; }
+    #modal-label {
+      padding: 0.5rem; text-align: center;
+      background: #333; color: #fff; font-weight: bold;
+    }
+    #close-button {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(255,255,255,0.8); border: none;
+      font-size: 1.5rem; line-height: 1;
+      padding: 2px 6px; border-radius: 4px;
+      cursor: pointer;
+    }
+    #close-button:hover { background: rgba(255,255,255,1); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h2>GLTF Folder Viewer</h2>
+    <input type="file" id="file-picker" webkitdirectory multiple />
+  </header>
+
+  <div id="grid" class="grid"></div>
+
+  <div id="modal" class="modal hidden">
+    <div id="modal-content">
+      <button id="close-button">&times;</button>
+      <canvas id="modal-canvas"></canvas>
+      <div id="modal-label"></div>
+    </div>
+  </div>
+
+  <!-- hidden canvas for thumbnail snapshots -->
+  <canvas id="thumb-canvas" style="display:none"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    // 1) Hidden renderer for all thumbnails
+    const thumbCanvas   = document.getElementById('thumb-canvas');
+    const thumbRenderer = new THREE.WebGLRenderer({ canvas: thumbCanvas, antialias: true, alpha: true });
+    const thumbScene    = new THREE.Scene();
+    const thumbCamera   = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+    thumbScene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1));
+    const thumbLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    thumbLight.position.set(5, 10, 7.5);
+    thumbScene.add(thumbLight);
+
+    // 2) Modal renderer + scene
+    const modal      = document.getElementById('modal');
+    const modalCanvas= document.getElementById('modal-canvas');
+    const modalLabel = document.getElementById('modal-label');
+    const closeBtn   = document.getElementById('close-button');
+    const modalRenderer = new THREE.WebGLRenderer({ canvas: modalCanvas, antialias: true, alpha: true });
+    const modalScene    = new THREE.Scene();
+    const modalCamera   = new THREE.PerspectiveCamera(45, 2, 0.1, 1000);
+    const modalControls = new OrbitControls(modalCamera, modalRenderer.domElement);
+    modalControls.enableDamping = true;
+    modalScene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1));
+    const modalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    modalLight.position.set(5, 10, 7.5);
+    modalScene.add(modalLight);
+
+    let currentModalModel = null;
+    (function animateModal() {
+      requestAnimationFrame(animateModal);
+      const { clientWidth: w, clientHeight: h } = modalCanvas;
+      if (modalCanvas.width !== w || modalCanvas.height !== h) {
+        modalRenderer.setSize(w, h, false);
+        modalCamera.aspect = w / h;
+        modalCamera.updateProjectionMatrix();
+      }
+      modalControls.update();
+      modalRenderer.render(modalScene, modalCamera);
+    })();
+
+    closeBtn.addEventListener('click', () => {
+      modal.classList.add('hidden');
+      if (currentModalModel) {
+        modalScene.remove(currentModalModel);
+        currentModalModel.traverse(c => c.geometry?.dispose());
+        currentModalModel = null;
+      }
+    });
+    // Close modal when clicking outside content
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        closeBtn.click();
+      }
+    });
+
+    // 3) Inline .bin/.png into Data-URIs
+    function arrayBufferToBase64(ab) {
+      let binary = '';
+      const bytes = new Uint8Array(ab);
+      for (let b of bytes) binary += String.fromCharCode(b);
+      return btoa(binary);
+    }
+    function fileToDataURL(file) {
+      return new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = () => res(reader.result);
+        reader.onerror = rej;
+        reader.readAsDataURL(file);
+      });
+    }
+    async function bundleGltf(file, fileMap) {
+      const text = await file.text();
+      const gltf = JSON.parse(text);
+      if (gltf.buffers) for (let buf of gltf.buffers) {
+        if (buf.uri) {
+          const name = buf.uri.split('/').pop();
+          if (fileMap.has(name)) {
+            const data = await fileMap.get(name).arrayBuffer();
+            buf.uri = `data:application/octet-stream;base64,${arrayBufferToBase64(data)}`;
+          }
+        }
+      }
+      if (gltf.images) for (let img of gltf.images) {
+        if (img.uri) {
+          const name = img.uri.split('/').pop();
+          if (fileMap.has(name)) {
+            img.uri = await fileToDataURL(fileMap.get(name));
+          }
+        }
+      }
+      return JSON.stringify(gltf);
+    }
+
+    // 4) GLTFLoader + fileMap
+    const loader  = new GLTFLoader();
+    const fileMap = new Map();
+    function parseFile(file) {
+      return new Promise(async (resolve, reject) => {
+        const lower = file.name.toLowerCase();
+        if (lower.endsWith('.glb')) {
+          const buf = await file.arrayBuffer();
+          loader.parse(buf, '', gltf => resolve(gltf.scene), err => reject(err));
+        } else {
+          const inlined = await bundleGltf(file, fileMap);
+          loader.parse(inlined, '', gltf => resolve(gltf.scene), err => reject(err));
+        }
+      });
+    }
+
+    // 5) Create thumbnail & center + scale + frame
+    async function createThumbnail(file) {
+      fileMap.set(file.name, file);
+      const thumbSize = 200;
+      const dpr = window.devicePixelRatio || 1;
+      thumbRenderer.setSize(thumbSize * dpr, thumbSize * dpr, false);
+      thumbCamera.aspect = 1;
+      thumbCamera.updateProjectionMatrix();
+
+      const container = document.createElement('div');
+      container.className = 'thumbnail';
+      const img   = document.createElement('img');
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = file.name;
+      container.append(img, label);
+      document.getElementById('grid').appendChild(container);
+
+      try {
+        const model = await parseFile(file);
+        // bounding sphere
+        const box    = new THREE.Box3().setFromObject(model);
+        const sphere = box.getBoundingSphere(new THREE.Sphere());
+        const center = sphere.center;
+        const radius = sphere.radius;
+        // center model
+        model.position.sub(center);
+        // frame camera
+        const vFOV = THREE.MathUtils.degToRad(thumbCamera.fov);
+        const dist = radius / Math.sin(vFOV / 2);
+        thumbCamera.position.set(0, 0, dist * 1.2);
+        thumbCamera.near = dist - radius * 2;
+        thumbCamera.far  = dist + radius * 2;
+        thumbCamera.lookAt(0, 0, 0);
+        thumbCamera.updateProjectionMatrix();
+
+        thumbScene.add(model);
+        thumbRenderer.render(thumbScene, thumbCamera);
+        img.src = thumbCanvas.toDataURL();
+        thumbScene.remove(model);
+        model.traverse(c => c.geometry?.dispose());
+      } catch (e) {
+        console.error(`Thumbnail error (${file.name}):`, e);
+        img.alt = '❌';
+      }
+
+      container.addEventListener('click', async () => {
+        modalLabel.textContent = file.name;
+        modal.classList.remove('hidden');
+        if (currentModalModel) {
+          modalScene.remove(currentModalModel);
+          currentModalModel.traverse(c => c.geometry?.dispose());
+          currentModalModel = null;
+        }
+        try {
+          const model = await parseFile(file);
+          const box2    = new THREE.Box3().setFromObject(model);
+          const sphere2 = box2.getBoundingSphere(new THREE.Sphere());
+          const center2 = sphere2.center;
+          const radius2 = sphere2.radius;
+          model.position.sub(center2);
+          // compute FOVs
+          const vFOV = THREE.MathUtils.degToRad(modalCamera.fov);
+          const hFOV = 2 * Math.atan(Math.tan(vFOV/2) * modalCamera.aspect);
+          const maxFOV = Math.max(vFOV, hFOV);
+          const dist2 = radius2 / Math.sin(maxFOV/2);
+          modalCamera.position.set(0, 0, dist2 * 1.1);
+          // Configure near/far to allow full zoom-out
+          // Allow very close near plane to avoid clipping when zoomed in
+          modalCamera.near = radius2 * 0.01;
+          // Far plane based on maxDistance from controls
+          modalControls.maxDistance = radius2 * 10;
+          modalCamera.far = modalControls.maxDistance * 1.2;
+          modalCamera.updateProjectionMatrix();
+          modalControls.target.set(0, 0, 0);
+          // Set zoom limits
+          modalControls.minDistance = radius2 * 0.1;
+          modalControls.update();
+
+          modalScene.add(model);
+          currentModalModel = model;
+        } catch (e) {
+          console.error(`Modal error (${file.name}):`, e);
+        }
+      });
+    }
+
+    // 6) Folder picker
+    document.getElementById('file-picker').addEventListener('change', ev => {
+      const files = Array.from(ev.target.files);
+      fileMap.clear();
+      files.forEach(f => fileMap.set(f.name, f));
+      const grid = document.getElementById('grid');
+      grid.innerHTML = '';
+      files.filter(f => /\.(gltf|glb)$/i.test(f.name)).forEach(createThumbnail);
+    });
+  </script>
+</body>
+</html>
